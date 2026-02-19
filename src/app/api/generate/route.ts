@@ -1,7 +1,27 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
 
+// ============================================================
+// レート制限（Upstash Redis → 永続化。未設定時はインメモリfallback）
+// ============================================================
 const DAILY_FREE_LIMIT = 3;
-const usageMap = new Map<string, { count: number; date: string }>();
+
+const hasUpstash =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN;
+
+// Upstash Ratelimit（本番用: サーバーレスでも永続）
+const ratelimit = hasUpstash
+  ? new Ratelimit({
+      redis: Redis.fromEnv(),
+      limiter: Ratelimit.fixedWindow(DAILY_FREE_LIMIT, "1 d"),
+      analytics: true,
+      prefix: "samune-shokunin",
+    })
+  : null;
+
+// インメモリfallback（開発用のみ — Vercel本番では使わないこと）
+const memoryMap = new Map<string, { count: number; date: string }>();
 
 function getClientIP(request: NextRequest): string {
   const forwarded = request.headers.get("x-forwarded-for");
@@ -9,36 +29,41 @@ function getClientIP(request: NextRequest): string {
   return "unknown";
 }
 
-function checkRateLimit(ip: string): { allowed: boolean; remaining: number } {
+async function checkAndIncrementLimit(
+  ip: string
+): Promise<{ allowed: boolean; remaining: number }> {
+  // Upstash（本番）
+  if (ratelimit) {
+    const result = await ratelimit.limit(ip);
+    return { allowed: result.success, remaining: result.remaining };
+  }
+
+  // インメモリfallback（開発用）
   const today = new Date().toISOString().slice(0, 10);
-  const usage = usageMap.get(ip);
+  const usage = memoryMap.get(ip);
   if (!usage || usage.date !== today) {
-    usageMap.set(ip, { count: 0, date: today });
-    return { allowed: true, remaining: DAILY_FREE_LIMIT };
+    memoryMap.set(ip, { count: 1, date: today });
+    return { allowed: true, remaining: DAILY_FREE_LIMIT - 1 };
   }
   if (usage.count >= DAILY_FREE_LIMIT) {
     return { allowed: false, remaining: 0 };
   }
+  usage.count++;
   return { allowed: true, remaining: DAILY_FREE_LIMIT - usage.count };
 }
 
-function incrementUsage(ip: string) {
-  const today = new Date().toISOString().slice(0, 10);
-  const usage = usageMap.get(ip);
-  if (usage && usage.date === today) {
-    usage.count++;
-  } else {
-    usageMap.set(ip, { count: 1, date: today });
-  }
-}
-
-type StyleType =
-  | "business"
-  | "education"
-  | "entertainment"
-  | "tech"
-  | "lifestyle"
-  | "news";
+// ============================================================
+// スタイル定義
+// ============================================================
+const VALID_STYLES = [
+  "business",
+  "education",
+  "entertainment",
+  "tech",
+  "lifestyle",
+  "news",
+] as const;
+type StyleType = (typeof VALID_STYLES)[number];
 
 const stylePrompts: Record<StyleType, string> = {
   business:
@@ -54,6 +79,12 @@ const stylePrompts: Record<StyleType, string> = {
   news:
     "News/commentary style. Bold red and white color scheme with high contrast. Urgent, attention-grabbing design. Clean sans-serif typography feel.",
 };
+
+// ============================================================
+// バリデーション定数
+// ============================================================
+const MAX_TITLE_LENGTH = 200;
+const MAX_KEYWORDS_LENGTH = 100;
 
 function buildImagePrompt(
   videoTitle: string,
@@ -81,7 +112,11 @@ CRITICAL RULES:
 - 16:9 aspect ratio (1280x720 equivalent composition)`;
 }
 
+// ============================================================
+// POST ハンドラ
+// ============================================================
 export async function POST(request: NextRequest) {
+  // --- APIキー確認 ---
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
@@ -90,8 +125,24 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // --- CSRF対策: Originヘッダー検証 ---
+  const origin = request.headers.get("origin");
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || "";
+  const allowedOrigins = [
+    siteUrl,
+    "http://localhost:3000",
+  ].filter(Boolean);
+
+  if (origin && allowedOrigins.length > 0 && !allowedOrigins.includes(origin)) {
+    return NextResponse.json(
+      { error: "不正なリクエスト元です。" },
+      { status: 403 }
+    );
+  }
+
+  // --- レート制限 ---
   const ip = getClientIP(request);
-  const { allowed, remaining } = checkRateLimit(ip);
+  const { allowed, remaining } = await checkAndIncrementLimit(ip);
 
   if (!allowed) {
     return NextResponse.json(
@@ -103,9 +154,10 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // --- リクエストボディのパース ---
   let body: {
     videoTitle: string;
-    style: StyleType;
+    style: string;
     keywords: string;
   };
 
@@ -120,6 +172,7 @@ export async function POST(request: NextRequest) {
 
   const { videoTitle, style, keywords } = body;
 
+  // --- サーバーサイド入力バリデーション ---
   if (!videoTitle || videoTitle.trim().length < 3) {
     return NextResponse.json(
       { error: "動画タイトルを3文字以上で入力してください。" },
@@ -127,10 +180,30 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  if (videoTitle.length > MAX_TITLE_LENGTH) {
+    return NextResponse.json(
+      { error: `タイトルは${MAX_TITLE_LENGTH}文字以内で入力してください。` },
+      { status: 400 }
+    );
+  }
+
+  if (keywords && keywords.length > MAX_KEYWORDS_LENGTH) {
+    return NextResponse.json(
+      { error: `キーワードは${MAX_KEYWORDS_LENGTH}文字以内で入力してください。` },
+      { status: 400 }
+    );
+  }
+
+  const validatedStyle: StyleType =
+    style && (VALID_STYLES as readonly string[]).includes(style)
+      ? (style as StyleType)
+      : "business";
+
+  // --- プロンプト生成 & OpenAI API呼び出し ---
   const prompt = buildImagePrompt(
-    videoTitle,
-    style || "business",
-    keywords || ""
+    videoTitle.trim(),
+    validatedStyle,
+    keywords?.trim() || ""
   );
 
   try {
@@ -157,15 +230,24 @@ export async function POST(request: NextRequest) {
       const errorData = await response.json().catch(() => ({}));
       console.error("OpenAI Images API error:", errorData);
 
-      if (response.status === 400 && errorData?.error?.code === "content_policy_violation") {
+      if (
+        response.status === 400 &&
+        errorData?.error?.code === "content_policy_violation"
+      ) {
         return NextResponse.json(
-          { error: "コンテンツポリシーに抵触する可能性があります。別の表現でお試しください。" },
+          {
+            error:
+              "コンテンツポリシーに抵触する可能性があります。別の表現でお試しください。",
+          },
           { status: 400 }
         );
       }
 
       return NextResponse.json(
-        { error: "画像生成中にエラーが発生しました。しばらく後に再度お試しください。" },
+        {
+          error:
+            "画像生成中にエラーが発生しました。しばらく後に再度お試しください。",
+        },
         { status: 502 }
       );
     }
@@ -181,12 +263,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    incrementUsage(ip);
-
     return NextResponse.json({
       imageUrl,
       revisedPrompt,
-      remaining: remaining - 1,
+      remaining,
     });
   } catch (error) {
     console.error("Generate error:", error);
