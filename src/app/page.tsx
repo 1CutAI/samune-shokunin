@@ -536,9 +536,18 @@ export default function Home() {
             <span>🎬</span>
             <span className="text-sm font-bold text-gray-400">サムネ職人</span>
           </div>
-          <p className="text-xs text-gray-600">
-            Powered by Trimora株式会社 | AI動画おまかせ便
-          </p>
+          <div className="flex items-center gap-4 text-xs text-gray-600">
+            <a href="https://trimora.jp" target="_blank" rel="noopener noreferrer" className="hover:text-gray-400 transition-colors">
+              Trimora株式会社
+            </a>
+            <span>|</span>
+            <a href="https://1cutai.com" target="_blank" rel="noopener noreferrer" className="hover:text-gray-400 transition-colors">
+              AI動画おまかせ便
+            </a>
+          </div>
+        </div>
+        <div className="mx-auto max-w-6xl mt-4 text-center text-xs text-gray-700">
+          &copy; {new Date().getFullYear()} Trimora Inc. All rights reserved.
         </div>
       </footer>
     </div>
